@@ -52,6 +52,8 @@ ExifTool is included in the Image-ExifTool/ directory.
 | `--task=ACTION` | Action: `copy` or `move` (default: dry-run) |
 | `--min-year=YYYY` | Minimum valid year for dates (default: 1990) |
 | `--no-fallback-date` | Don't use system file modification date as fallback |
+| `--ignoreFile=P1,P2` | Skip files whose full path contains any of the given substrings (comma-separated). Matched before EXIF analysis — ignored files are not copied/moved and are logged to `log_ignored_files.log`. Matching is **case-sensitive** and strips leading/trailing spaces from each pattern. Example: `--ignoreFile=Screenshot_,Paint_,WhatsApp` |
+| `--keepSourceTag` | Append a source label (`_WhatsApp`, `_Signal`, `_Screenshot`, etc.) to the generated filename for known source types. Files with no matching rule stay plain `IMG_`/`VID_`. Rules are defined in `SOURCE_TAG_RULES` at the top of the script. |
 | `-h, --help` | Display help message |
 
 ### Usage Examples
@@ -74,6 +76,21 @@ ExifTool is included in the Image-ExifTool/ directory.
 
 # Exclude files without valid EXIF dates
 ./manage_images.sh --task=copy --no-fallback-date ./photos ./organized
+
+# Skip screenshots and screen-capture files (case-sensitive substring match on full path)
+./manage_images.sh --task=copy --ignoreFile=Screenshot_,Paint_ ./photos ./organized
+
+# Combine: skip screenshots and only process files with EXIF dates from 2010+
+./manage_images.sh --task=copy --min-year=2010 --no-fallback-date --ignoreFile=Screenshot_,Paint_ ./photos ./organized
+
+# Label social media files with source tag in filename
+./manage_images.sh --task=copy --keepSourceTag ./photos ./organized
+
+# Full production run: skip screenshots, label social media, logs to /var/log
+LOG_DIR=/var/log/photos ./manage_images.sh --task=move \
+  --ignoreFile=Screenshot_,Paint_ \
+  --keepSourceTag \
+  /volume1/IMPORTER /volume1/photo/ARCHIWUM
 ```
 
 ### Date Source Priority
@@ -85,8 +102,15 @@ The script attempts to extract dates from multiple sources in this order:
 3. MediaCreateDate (for video files)
 4. TrackCreateDate (alternative video date field)
 5. ModifyDate (last modification time in EXIF)
-6. Filename Parsing (IMG_YYYYMMDD_HHMMSS.jpg, YYYYMMDD_HHMMSS.ext, Screenshot_YYYYMMDD-HHMMSS.png)
-7. FileModifyDate (least reliable - system file modification date)
+6. Filename Parsing — patterns supported:
+   - `YYYYMMDD_HHMMSS` — Android/Samsung (`IMG_`, `VID_`, `PXL_`, `MVIMG_`, `PANO_`, etc.)
+   - `YYYYMMDD-HHMMSS` — Android screenshots (`Screenshot_YYYYMMDD-HHMMSS`)
+   - `YYYY-MM-DD_HH-MM-SS` — some export tools
+   - `YYYY-MM-DD-HHMMSS` — Signal messenger (`signal-2023-10-15-143022.jpg`)
+   - `YYYYMMDD` (date only, time = 00:00:00) — WhatsApp (`IMG-20231015-WA0001.jpg`)
+7. XMP sidecar file (`filename.xmp` alongside the photo — Adobe, Lightroom, Darktable)
+8. Directory path (`YYYY/MM/DD` in path — day-level precision, time = 00:00:00)
+9. FileModifyDate (least reliable - system file modification date)
 
 ### Processing Flow - File with Valid EXIF Date
 
@@ -200,6 +224,7 @@ target_directory/
 | `log_removed_duplicates.log` | Source files removed in move mode |
 | `log_rejected_dates.log` | Files with invalid or missing dates |
 | `log_exif_updates.log` | Files where dates written to EXIF |
+| `log_ignored_files.log` | Files skipped due to `--ignoreFile` pattern match (not copied/moved) |
 
 ### Duplicate Handling
 
@@ -493,11 +518,18 @@ Step 2: Copy first 10 files
 Verify files appear in correct YYYY/MM/DD directories.
 
 Step 3: Review all log files
+
+Logs are saved in a timestamped subdirectory: `logs/YYYY_MM_DD_HH_MM_SS/`
+
 ```bash
-ls -lh log_*.log
-cat log_processed_files.log
-cat log_rejected_dates.log
-cat log_exif_updates.log
+# Find the latest log run
+ls -lt logs/ | head -3
+
+# Read logs from the latest run (adjust timestamp)
+cat logs/$(ls -t logs/ | head -1)/log_processed_files.log
+cat logs/$(ls -t logs/ | head -1)/log_rejected_dates.log
+cat logs/$(ls -t logs/ | head -1)/log_exif_updates.log
+cat logs/$(ls -t logs/ | head -1)/log_ignored_files.log
 ```
 
 Step 4: Expand to 100 files
@@ -637,8 +669,6 @@ Example:
 ./manage_images.sh --task=copy photos_2021/ organized_2021/
 ./manage_images.sh --task=copy photos_2022/ organized_2022/
 ```
-./manage_images.sh --task=copy photos_2022/ organized_2022/
-```
 
 ---
 
@@ -679,6 +709,16 @@ File extensions are matched case-insensitively:
 
 ## Version History
 
+### Version 3.0 (May 2026)
+- Added `--ignoreFile` option to skip files by path pattern (before EXIF analysis)
+- Added `--keepSourceTag` option with configurable `SOURCE_TAG_RULES` table
+- Built-in source types: Screenshot, WhatsApp, Signal, Telegram, Messenger, Viber, Facebook, Wiadomosci, Paint
+- Extended filename date parsing: Signal (`YYYY-MM-DD-HHMMSS`), WhatsApp date-only (`YYYYMMDD`), dash-separated (`YYYY-MM-DD_HH-MM-SS`)
+- Added XMP sidecar file support (Adobe, Lightroom, Darktable)
+- Added directory path date fallback (`YYYY/MM/DD` in path)
+- Fixed dead code in filename parser (Pattern 2 was unreachable)
+- Logs now saved to timestamped subdirectory `logs/YYYY_MM_DD_HH_MM_SS/`
+
 ### Version 2.0 (December 2025)
 - Added remove_empty_dirs.sh utility
 - Enhanced documentation structure
@@ -690,4 +730,3 @@ File extensions are matched case-insensitively:
 - Core EXIF and filename parsing
 - Duplicate detection via MD5
 - Log file generation
-

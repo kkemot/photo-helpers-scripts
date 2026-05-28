@@ -33,6 +33,47 @@ IMAGE_EXTENSIONS="jpg jpeg png gif bmp tiff tif raw cr2 nef arw dng heic heif we
 # Video file extensions
 VIDEO_EXTENSIONS="mp4 mov avi mkv wmv flv webm m4v mpg mpeg 3gp mts m2ts"
 
+# File path patterns to ignore (substring match against full path)
+# Can be extended at runtime via --ignoreFile=Pattern1,Pattern2
+IGNORE_FILE_PATTERNS=()
+
+# Known source types for --keepSourceTag.
+# Format: "path_pattern:TagLabel" — if the full file path contains path_pattern,
+# the TagLabel is appended to the generated filename.
+# Patterns are checked in order; first match wins.
+# Add or remove entries to customise which sources get labelled.
+SOURCE_TAG_RULES=(
+    "Screenshot_:Screenshot"
+    "screenshot_:Screenshot"
+    "Screenshots/:Screenshot"
+    "-WA:WhatsApp"
+    "WhatsApp:WhatsApp"
+    "Whatsapp:WhatsApp"
+    "whatsapp:WhatsApp"
+    "Signal/:Signal"
+    "signal-:Signal"
+    "Telegram:Telegram"
+    "telegram:Telegram"
+    "Messenger:Messenger"
+    "messenger:Messenger"
+    "Viber:Viber"
+    "viber:Viber"
+    "FB_IMG_:Facebook"
+    "FB_VID_:Facebook"
+    "received_:Facebook"
+    "Facebook:Facebook"
+    "facebook:Facebook"
+    "Wiadomości/:Wiadomosci"
+    "Wiadomosci/:Wiadomosci"
+    "Messages/:Wiadomosci"
+    "MmsCamera:Wiadomosci"
+    "Paint_:Paint"
+    "paint_:Paint"
+)
+
+# Whether to append source tag to generated filename (set by --keepSourceTag)
+KEEP_SOURCE_TAG="no"
+
 # Directories to skip (Picasa, Synology NAS, etc.)
 EXCLUDE_DIRS=(
     "@eaDir"
@@ -74,6 +115,23 @@ OPTIONS:
     --task=ACTION           Action to perform: copy, move (default: dry-run)
     --no-fallback-date      Don't use system date as fallback (files without EXIF = NONE)
     --min-year=YYYY         Minimum year for EXIF dates (default: 1990)
+    --ignoreFile=P1,P2      Skip files whose path contains any of the given substrings
+                            (comma-separated, e.g. Screenshot_,Paint_)
+    --keepSourceTag         Append a label to the filename for known source types.
+                            Only files matching a defined rule receive a tag —
+                            unrecognised files stay plain (IMG_.../VID_...).
+                            Built-in types: Screenshot, WhatsApp, Signal, Telegram,
+                                            Messenger, Viber, Facebook, Wiadomosci, Paint
+                            Patterns are matched against the FULL path (filename + dirs).
+                            Examples:
+                              Screenshot_20230709-113040.png  → IMG_20230709_113040_990_Screenshot.png
+                              signal-2023-10-15-143022.jpg    → IMG_20231015_143022_Signal.jpg
+                              IMG-20231015-WA0001.jpg         → IMG_20231015_000000_WhatsApp.jpg
+                              WhatsApp-2023-10-15-143022.jpg  → IMG_20231015_143022_WhatsApp.jpg
+                              FB_IMG_1697376732123.jpg        → IMG_20231015_143022_Facebook.jpg
+                              Facebook/IMG_20231015.jpg       → IMG_20231015_000000_Facebook.jpg
+                              Messages/photo.jpg              → IMG_20231015_000000_Wiadomosci.jpg
+                              IMG_20231003_191232.jpg         → IMG_20231003_191232.jpg  (no tag)
 
 ENVIRONMENT VARIABLES:
     LOG_DIR                 Directory for log files (default: current directory)
@@ -122,6 +180,12 @@ EXAMPLES:
     # Moving with limit and minimum year 2000
     $0 --task=move --limit=100 --min-year=2000 ./src ./res
     
+    # Skip screenshots and Paint files
+    $0 --task=copy --ignoreFile=Screenshot_,Paint_ ./src ./res
+    
+    # Preserve source label in filename (Screenshot, Signal, WA, etc.)
+    $0 --task=copy --keepSourceTag ./src ./res
+    
     # Full path, only EXIF > 2010, logs to /tmp
     LOG_DIR=/tmp $0 --task=copy --min-year=2010 /home/user/photos /home/user/output
 
@@ -132,7 +196,46 @@ SUPPORTED EXTENSIONS:
 SKIPPED DIRECTORIES:
     $(printf '%s, ' "${EXCLUDE_DIRS[@]}" | sed 's/, $//')
 
+SKIPPED FILE PATTERNS (--ignoreFile):
+    $([ ${#IGNORE_FILE_PATTERNS[@]} -gt 0 ] && printf '%s, ' "${IGNORE_FILE_PATTERNS[@]}" | sed 's/, $//' || echo "(none)")
+
 EOF
+}
+
+# Check if file path matches any of the ignore patterns
+# Returns 0 (true) if the file should be ignored, 1 (false) otherwise
+should_ignore_file() {
+    local file="$1"
+    for pattern in "${IGNORE_FILE_PATTERNS[@]}"; do
+        if [[ "$file" == *"$pattern"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Extract a source tag by matching the full file path against SOURCE_TAG_RULES.
+# Returns the TagLabel of the first matching rule, or empty string if no rule matches.
+# Only files whose path contains a known pattern receive a tag — all others stay plain.
+#
+# Examples (with default rules):
+#   .../Screenshots/Screenshot_20230709-113040.png  → "Screenshot"
+#   .../signal-2023-10-15-143022.jpg                → "Signal"
+#   .../IMG-20231015-WA0001.jpg                     → "WhatsApp"
+#   .../WhatsApp/IMG_20231015_143022.jpg             → "WhatsApp"
+#   .../IMG_20231003_191232.jpg                     → "" (no rule matches → no tag)
+#
+extract_source_tag() {
+    local file="$1"
+    for rule in "${SOURCE_TAG_RULES[@]}"; do
+        local pattern="${rule%%:*}"
+        local tag="${rule##*:}"
+        if [[ "$file" == *"$pattern"* ]]; then
+            echo "$tag"
+            return 0
+        fi
+    done
+    # No rule matched — return empty (no tag appended)
 }
 
 # Build find pattern for excluded directories
@@ -269,12 +372,22 @@ is_video_file() {
 #    - Less reliable (changes when edited)
 #
 # 6. Filename parsing (if filename contains date pattern)
-#    - Patterns: IMG_YYYYMMDD_HHMMSS, YYYYMMDD_HHMMSS, Screenshot_YYYYMMDD-HHMMSS
+#    - Patterns: YYYYMMDD_HHMMSS, YYYYMMDD-HHMMSS,
+#                YYYY-MM-DD_HH-MM-SS, YYYY-MM-DD-HHMMSS,
+#                YYYYMMDD (date-only, WhatsApp etc.)
 #    - Extracted date is validated (min_year check)
 #    - Automatically written to EXIF (DateTimeOriginal + CreateDate)
 #    - See log_exif_updates.log for write operations
 #
-# 7. FileModifyDate (system file modification date)
+# 7. XMP sidecar file (filename.xmp alongside the photo)
+#    - Adobe/Lightroom/Darktable metadata
+#    - Fields: xmp:CreateDate, xmp:MetadataDate, photoshop:DateCreated
+#
+# 8. Directory path parsing (YYYY/MM/DD in path)
+#    - Day-level precision only (time set to 00:00:00)
+#    - Used when file is already partially organized
+#
+# 9. FileModifyDate (system file modification date)
 #    - Last resort, least reliable (changes on copy/move)
 #    - Validated with warning if very recent (< 30 days)
 #
@@ -373,16 +486,21 @@ generate_new_path() {
     # Get extension
     local ext="${file##*.}"
     
-    # Generate new name: PREFIX_YYYYMMDD_HHMMSS[_sss].ext
-    # Date format: no separators (20061225_113031)
+    # Optional source tag (e.g. "Screenshot", "Signal", "WA")
+    local tag=""
+    if [ "$KEEP_SOURCE_TAG" = "yes" ]; then
+        tag=$(extract_source_tag "$file")
+    fi
+    
+    # Generate new name: PREFIX_YYYYMMDD_HHMMSS[_sss][_Tag].ext
     local new_filename
+    local tag_suffix=""
+    [ -n "$tag" ] && tag_suffix="_${tag}"
     if [ -n "$subsec" ]; then
-        # Normalize milliseconds to 3 digits (padding with zeros on right)
-        # Examples: "5" → "500", "12" → "120", "123" → "123"
         local subsec_padded=$(printf "%-3s" "$subsec" | tr ' ' '0')
-        new_filename="${prefix}_${year}${month}${day}_${time}_${subsec_padded}.${ext}"
+        new_filename="${prefix}_${year}${month}${day}_${time}_${subsec_padded}${tag_suffix}.${ext}"
     else
-        new_filename="${prefix}_${year}${month}${day}_${time}.${ext}"
+        new_filename="${prefix}_${year}${month}${day}_${time}${tag_suffix}.${ext}"
     fi
     
     # Generate full path: output_dir/YYYY/MM/DD/filename
@@ -413,6 +531,12 @@ scan_files() {
         echo "Mode:              $task"
     else
         echo "Mode:              dry-run (analysis only)"
+    fi
+    if [ ${#IGNORE_FILE_PATTERNS[@]} -gt 0 ]; then
+        echo "Ignore patterns:   $(IFS=', '; echo "${IGNORE_FILE_PATTERNS[*]}")"
+    fi
+    if [ "$KEEP_SOURCE_TAG" = "yes" ]; then
+        echo "Keep source tag:   yes (source label appended to filename)"
     fi
     echo ""
     echo "Documentation: See README.md and DETAILS.md in script directory for more information"
@@ -492,6 +616,11 @@ analyze_exif_dates() {
     local rejected_log="$log_subdir/log_rejected_dates.log"
     rm -f "$rejected_log"
     
+    # File with ignored paths
+    local ignored_log="$log_subdir/log_ignored_files.log"
+    rm -f "$ignored_log"
+    local ignored_count=0
+    
     # Process each file individually for accurate EXIF reading
     # This ensures proper date priority and avoids batch parsing issues
     local current=0
@@ -499,6 +628,15 @@ analyze_exif_dates() {
     
     while IFS= read -r file; do
         [ -z "$file" ] && continue
+        
+        # Skip files matching ignore patterns
+        if should_ignore_file "$file"; then
+            echo "IGNORED: $file" >> "$ignored_log"
+            ignored_count=$((ignored_count + 1))
+            total=$((total - 1))
+            [ "$total" -eq 0 ] && total=1
+            continue
+        fi
         
         current=$((current + 1))
         local percent=$((current * 100 / total))
@@ -526,6 +664,12 @@ analyze_exif_dates() {
             
     done < "$file_list"
     
+    # Show information about ignored files
+    if [ "$ignored_count" -gt 0 ]; then
+        echo ""
+        echo "Ignored: $ignored_count files (pattern match, details in $ignored_log)"
+    fi
+    
     # Show information about rejected dates
     if [ -f "$rejected_log" ]; then
         local rejected_count=$(wc -l < "$rejected_log")
@@ -540,56 +684,67 @@ analyze_exif_dates() {
 }
 
 # Parse date from filename (e.g., IMG_20130410_094342.jpg → 2013-04-10 09:43:42)
+#
+# Supported patterns (in order of precedence):
+#  1. YYYYMMDD_HHMMSS  — Android/Samsung (IMG_, VID_, PXL_, MVIMG_, PANO_, etc.)
+#  2. YYYYMMDD-HHMMSS  — Android screenshots (Screenshot_YYYYMMDD-HHMMSS)
+#  3. YYYY-MM-DD_HH-MM-SS — some export tools
+#  4. YYYY-MM-DD-HHMMSS   — Signal messenger
+#  5. YYYYMMDD (date only) — WhatsApp (IMG-YYYYMMDD-WAxxxx), day-resolution fallback
+#
 parse_date_from_filename() {
     local filename="$1"
     local basename=$(basename "$filename")
     
-    # Pattern 1: IMG_YYYYMMDD_HHMMSS or similar
+    local year month day hour min sec
+    
+    # Pattern 1: ...YYYYMMDD_HHMMSS... (underscore separator)
+    # Covers: IMG_, VID_, PXL_, MVIMG_, PANO_, Screenshot_, bare YYYYMMDD_HHMMSS, etc.
     if [[ "$basename" =~ ([0-9]{8})_([0-9]{6}) ]]; then
         local date_part="${BASH_REMATCH[1]}"
         local time_part="${BASH_REMATCH[2]}"
-        
-        local year="${date_part:0:4}"
-        local month="${date_part:4:2}"
-        local day="${date_part:6:2}"
-        local hour="${time_part:0:2}"
-        local min="${time_part:2:2}"
-        local sec="${time_part:4:2}"
-        
+        year="${date_part:0:4}"; month="${date_part:4:2}"; day="${date_part:6:2}"
+        hour="${time_part:0:2}"; min="${time_part:2:2}"; sec="${time_part:4:2}"
         echo "${year}-${month}-${day} ${hour}:${min}:${sec}"
         return 0
     fi
     
-    # Pattern 2: YYYYMMDD_HHMMSS at the beginning
-    if [[ "$basename" =~ ^([0-9]{8})_([0-9]{6}) ]]; then
-        local date_part="${BASH_REMATCH[1]}"
-        local time_part="${BASH_REMATCH[2]}"
-        
-        local year="${date_part:0:4}"
-        local month="${date_part:4:2}"
-        local day="${date_part:6:2}"
-        local hour="${time_part:0:2}"
-        local min="${time_part:2:2}"
-        local sec="${time_part:4:2}"
-        
-        echo "${year}-${month}-${day} ${hour}:${min}:${sec}"
-        return 0
-    fi
-    
-    # Pattern 3: Screenshot_YYYYMMDD-HHMMSS
+    # Pattern 2: ...YYYYMMDD-HHMMSS... (dash separator)
+    # Covers: Screenshot_YYYYMMDD-HHMMSS (Android), some cameras
     if [[ "$basename" =~ ([0-9]{8})-([0-9]{6}) ]]; then
         local date_part="${BASH_REMATCH[1]}"
         local time_part="${BASH_REMATCH[2]}"
-        
-        local year="${date_part:0:4}"
-        local month="${date_part:4:2}"
-        local day="${date_part:6:2}"
-        local hour="${time_part:0:2}"
-        local min="${time_part:2:2}"
-        local sec="${time_part:4:2}"
-        
+        year="${date_part:0:4}"; month="${date_part:4:2}"; day="${date_part:6:2}"
+        hour="${time_part:0:2}"; min="${time_part:2:2}"; sec="${time_part:4:2}"
         echo "${year}-${month}-${day} ${hour}:${min}:${sec}"
         return 0
+    fi
+    
+    # Pattern 3: YYYY-MM-DD_HH-MM-SS (dashes in both date and time parts)
+    # Covers: photo_2023-10-15_14-30-22.jpg
+    if [[ "$basename" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})_([0-9]{2})-([0-9]{2})-([0-9]{2}) ]]; then
+        echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+        return 0
+    fi
+    
+    # Pattern 4: YYYY-MM-DD-HHMMSS (Signal: signal-2023-10-15-143022001.jpg)
+    if [[ "$basename" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{6}) ]]; then
+        local time_part="${BASH_REMATCH[4]}"
+        hour="${time_part:0:2}"; min="${time_part:2:2}"; sec="${time_part:4:2}"
+        echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${hour}:${min}:${sec}"
+        return 0
+    fi
+    
+    # Pattern 5: YYYYMMDD date-only (WhatsApp: IMG-20231015-WA0001.jpg)
+    # Time is set to 00:00:00 — only day-level precision
+    if [[ "$basename" =~ ([0-9]{8}) ]]; then
+        local date_part="${BASH_REMATCH[1]}"
+        year="${date_part:0:4}"; month="${date_part:4:2}"; day="${date_part:6:2}"
+        # Basic sanity: month 01-12, day 01-31
+        if [[ "$month" =~ ^(0[1-9]|1[0-2])$ ]] && [[ "$day" =~ ^(0[1-9]|[12][0-9]|3[01])$ ]]; then
+            echo "${year}-${month}-${day} 00:00:00"
+            return 0
+        fi
     fi
     
     return 1
@@ -726,6 +881,40 @@ process_exif_data() {
             # Write parsed date to EXIF for future reliability
             local exif_update_log="$log_subdir/log_exif_updates.log"
             write_exif_date "$full_path" "$date" "filename" "$exif_update_log"
+        fi
+    fi
+    
+    # Try XMP sidecar file (Adobe/Lightroom/Darktable metadata)
+    # XMP file has same name as photo but .xmp extension
+    if [ -z "$date" ]; then
+        local xmp_file="${full_path%.*}.xmp"
+        [ ! -f "$xmp_file" ] && xmp_file="${full_path%.*}.XMP"
+        if [ -f "$xmp_file" ]; then
+            local xmp_date
+            xmp_date=$(grep -o 'xmp:CreateDate="[^"]*"' "$xmp_file" 2>/dev/null | head -1 | cut -d'"' -f2)
+            [ -z "$xmp_date" ] && xmp_date=$(grep -o 'xmp:MetadataDate="[^"]*"' "$xmp_file" 2>/dev/null | head -1 | cut -d'"' -f2)
+            [ -z "$xmp_date" ] && xmp_date=$(grep -o 'photoshop:DateCreated>[^<]*' "$xmp_file" 2>/dev/null | head -1 | cut -d'>' -f2)
+            # XMP date format: 2023-10-15T14:30:22 → normalize to 2023-10-15 14:30:22
+            xmp_date=$(echo "$xmp_date" | sed 's/T/ /' | cut -c1-19)
+            if [ -n "$xmp_date" ] && validate_date "$xmp_date" "$min_year"; then
+                date="$xmp_date"
+                date_source="XMP"
+            fi
+        fi
+    fi
+    
+    # Try directory-based date (last resort before FileModifyDate)
+    # If path contains YYYY/MM/DD structure, extract it
+    if [ -z "$date" ]; then
+        local dir_date
+        dir_date=$(echo "$full_path" | grep -o '[0-9]\{4\}/[0-9]\{2\}/[0-9]\{2\}' | tail -1)
+        if [ -n "$dir_date" ]; then
+            dir_date=$(echo "$dir_date" | tr '/' '-')
+            dir_date="$dir_date 00:00:00"
+            if validate_date "$dir_date" "$min_year"; then
+                date="$dir_date"
+                date_source="DirectoryPath"
+            fi
         fi
     fi
     
@@ -919,6 +1108,7 @@ process_files() {
         [ -f "$removed_log" ] && echo "  Removed duplicates: $removed_log"
         [ -f "$processed_log" ] && echo "  Processed files:    $processed_log"
         [ -f "$failed_log" ] && echo "  Errors:             $failed_log"
+        [ -f "$log_subdir/log_ignored_files.log" ] && echo "  Ignored (pattern):  $log_subdir/log_ignored_files.log"
     fi
     
     # Show examples
@@ -966,6 +1156,19 @@ display_statistics() {
     if [ $total_count -eq 0 ]; then
         echo "No files found to process"
         return
+    fi
+    
+    # Ignored files summary (log written by analyze_exif_dates into LOG_SUBDIR)
+    local ignored_count_stat=0
+    if [ -f "$LOG_SUBDIR/log_ignored_files.log" ]; then
+        ignored_count_stat=$(wc -l < "$LOG_SUBDIR/log_ignored_files.log")
+    fi
+    if [ "$ignored_count_stat" -gt 0 ]; then
+        printf "Ignored (pattern):     %5d files (excluded before EXIF analysis)\n" "$ignored_count_stat"
+        local analyzed_count=$(( total_count - ignored_count_stat ))
+        [ "$analyzed_count" -lt 0 ] && analyzed_count=0
+        printf "Analyzed:              %5d files\n" "$analyzed_count"
+        echo ""
     fi
     
     # Statistics by extensions
@@ -1071,6 +1274,7 @@ main() {
     local min_year="1990"
     local src_dir=""
     local output_dir=""
+    local ignore_file_arg=""
     
     # Check if help requested
     if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -1095,6 +1299,14 @@ main() {
                 ;;
             --no-fallback-date)
                 no_fallback="no-fallback"
+                shift
+                ;;
+            --keepSourceTag)
+                KEEP_SOURCE_TAG="yes"
+                shift
+                ;;
+            --ignoreFile=*)
+                ignore_file_arg="${1#*=}"
                 shift
                 ;;
             -h|--help)
@@ -1141,6 +1353,19 @@ main() {
     if ! [[ "$min_year" =~ ^[0-9]{4}$ ]]; then
         echo "Error: --min-year must be a 4-digit year (e.g. 2000)"
         exit 1
+    fi
+    
+    # Parse --ignoreFile patterns (comma-separated) into global array
+    # Leading/trailing whitespace is stripped from each pattern so that
+    # "--ignoreFile=Screenshot_, Paint_" works the same as "Screenshot_,Paint_"
+    if [ -n "$ignore_file_arg" ]; then
+        IFS=',' read -ra _raw_patterns <<< "$ignore_file_arg"
+        for _p in "${_raw_patterns[@]}"; do
+            _p="${_p#"${_p%%[! ]*}"}"  # trim leading spaces
+            _p="${_p%"${_p##*[! ]}"}"  # trim trailing spaces
+            [ -n "$_p" ] && IGNORE_FILE_PATTERNS+=("$_p")
+        done
+        unset _raw_patterns _p
     fi
     
     # Check requirements
@@ -1208,4 +1433,3 @@ main() {
 
 # Run main function
 main "$@"
-
