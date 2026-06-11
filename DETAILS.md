@@ -52,7 +52,7 @@ ExifTool is included in the Image-ExifTool/ directory.
 | `--task=ACTION` | Action: `copy` or `move` (default: dry-run) |
 | `--min-year=YYYY` | Minimum valid year for dates (default: 1990) |
 | `--no-fallback-date` | Don't use system file modification date as fallback |
-| `--ignoreFile=P1,P2` | Skip files whose full path contains any of the given substrings (comma-separated). Matched before EXIF analysis — ignored files are not copied/moved and are logged to `log_ignored_files.log`. Matching is **case-sensitive** and strips leading/trailing spaces from each pattern. Example: `--ignoreFile=Screenshot_,Paint_,WhatsApp` |
+| `--ignoreFile=P1,P2` | Skip files whose full path contains any of the given substrings (comma-separated). Matched before EXIF analysis — ignored files are not copied/moved and are logged to `log_ignored_files.log`. Matching is **case-sensitive** and strips leading/trailing spaces from each pattern. Example: `--ignoreFile=Screenshot_,Paint_,WhatsApp`. By default the script also skips Synology photo cache thumbnails matching `SYNOPHOTO_THUMB_`. |
 | `--keepSourceTag` | Append a source label (`_WhatsApp`, `_Signal`, `_Screenshot`, etc.) to the generated filename for known source types. Files with no matching rule stay plain `IMG_`/`VID_`. Rules are defined in `SOURCE_TAG_RULES` at the top of the script. |
 | `-h, --help` | Display help message |
 
@@ -102,12 +102,16 @@ The script attempts to extract dates from multiple sources in this order:
 3. MediaCreateDate (for video files)
 4. TrackCreateDate (alternative video date field)
 5. ModifyDate (last modification time in EXIF)
-6. Filename Parsing — patterns supported:
+6. Filename Parsing — patterns supported (in order):
    - `YYYYMMDD_HHMMSS` — Android/Samsung (`IMG_`, `VID_`, `PXL_`, `MVIMG_`, `PANO_`, etc.)
    - `YYYYMMDD-HHMMSS` — Android screenshots (`Screenshot_YYYYMMDD-HHMMSS`)
+   - `FB_IMG_/FB_VID_` unix timestamp — Facebook shared media (`FB_IMG_1697376732123.jpg`)
+   - `YYYYMMDD.HHMMSS` — dot-separated time (`IMG_20231015.143022.jpg`)
    - `YYYY-MM-DD_HH-MM-SS` — some export tools
+   - `YYYY-MM-DD-HH-MM-SS` — **DYTCamera and other apps** (NEW: `2024-11-21-19-21-29`, `2025-07-04-19-01-50-b09d0`)
    - `YYYY-MM-DD-HHMMSS` — Signal messenger (`signal-2023-10-15-143022.jpg`)
    - `YYYYMMDD` (date only, time = 00:00:00) — WhatsApp (`IMG-20231015-WA0001.jpg`)
+   - Dates are validated (min_year check) and automatically written back to EXIF
 7. XMP sidecar file (`filename.xmp` alongside the photo — Adobe, Lightroom, Darktable)
 8. Directory path (`YYYY/MM/DD` in path — day-level precision, time = 00:00:00)
 9. FileModifyDate (least reliable - system file modification date)
@@ -137,7 +141,7 @@ Result: COPY or MOVE
 ### Processing Flow - File without EXIF Date (Filename Parsing)
 
 ```
-Input: /photos/IMG_20230410_094342.jpg
+Input: /photos/DYTCamera/2024/11/2024-11-21-19-21-29-50d99.jpg
   |
   v
 [Read EXIF Metadata]
@@ -145,8 +149,8 @@ Input: /photos/IMG_20230410_094342.jpg
   |
   v
 [Parse Filename]
-  Matched pattern: IMG_YYYYMMDD_HHMMSS
-  Extracted: 2023-04-10 09:43:42
+  Matched pattern: YYYY-MM-DD-HH-MM-SS (DYTCamera format)
+  Extracted: 2024-11-21 19:21:29
   |
   v
 [Validate Parsed Date]
@@ -155,14 +159,14 @@ Input: /photos/IMG_20230410_094342.jpg
   |
   v
 [Write Date to EXIF]
-  DateTimeOriginal = 2023:04:10 09:43:42
+  DateTimeOriginal = 2024:11:21 19:21:29
   Logged: log_exif_updates.log
   |
   v
 [Generate Target Path]
   |
   v
-Output: /organized/2023/04/10/IMG_20230410_094342.jpg
+Output: /organized/2024/11/21/IMG_20241121_192129.jpg
 Result: COPY or MOVE
 ```
 
@@ -408,7 +412,7 @@ Errors:                    1 directories
 
 ### Ignored Directories
 
-These directories are detected and preserved:
+These directories and system files are detected and preserved or ignored:
 
 - @eaDir (Synology metadata)
 - .picasaoriginals (Google Picasa)
@@ -419,6 +423,8 @@ These directories are detected and preserved:
 - .synology (Synology system)
 - @tmp (Temporary)
 - .DS_Store (macOS metadata)
+- desktop.ini (Windows metadata)
+- ehthumbs.db (Windows thumbnail cache)
 - Thumbs.db (Windows metadata)
 
 ---

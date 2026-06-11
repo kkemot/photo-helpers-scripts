@@ -35,7 +35,8 @@ VIDEO_EXTENSIONS="mp4 mov avi mkv wmv flv webm m4v mpg mpeg 3gp mts m2ts"
 
 # File path patterns to ignore (substring match against full path)
 # Can be extended at runtime via --ignoreFile=Pattern1,Pattern2
-IGNORE_FILE_PATTERNS=()
+# Default built-in ignore patterns skip Synology photo cache thumbnails.
+IGNORE_FILE_PATTERNS=("SYNOPHOTO_THUMB_")
 
 # Known source types for --keepSourceTag.
 # Format: "path_pattern:TagLabel" — if the full file path contains path_pattern,
@@ -86,6 +87,8 @@ EXCLUDE_DIRS=(
     "@tmp"
     ".DS_Store"
     "Thumbs.db"
+    "desktop.ini"
+    "ehthumbs.db"
 )
 
 # ====================================
@@ -686,11 +689,14 @@ analyze_exif_dates() {
 # Parse date from filename (e.g., IMG_20130410_094342.jpg → 2013-04-10 09:43:42)
 #
 # Supported patterns (in order of precedence):
-#  1. YYYYMMDD_HHMMSS  — Android/Samsung (IMG_, VID_, PXL_, MVIMG_, PANO_, etc.)
-#  2. YYYYMMDD-HHMMSS  — Android screenshots (Screenshot_YYYYMMDD-HHMMSS)
-#  3. YYYY-MM-DD_HH-MM-SS — some export tools
-#  4. YYYY-MM-DD-HHMMSS   — Signal messenger
-#  5. YYYYMMDD (date only) — WhatsApp (IMG-YYYYMMDD-WAxxxx), day-resolution fallback
+#  1. FB_IMG_/FB_VID_ unix timestamp — Facebook shared media (`FB_IMG_1697376732123.jpg`)
+#  2. YYYYMMDD_HHMMSS  — Android/Samsung (IMG_, VID_, PXL_, MVIMG_, PANO_, etc.)
+#  3. YYYYMMDD.HHMMSS  — dot-separated time (`IMG_20231015.143022.jpg`)
+#  4. YYYYMMDD-HHMMSS  — Android screenshots (Screenshot_YYYYMMDD-HHMMSS)
+#  5. YYYY-MM-DD_HH-MM-SS — some export tools
+#  6. YYYY-MM-DD-HH-MM-SS — DYTCamera and other apps (e.g., 2024-11-21-19-21-29)
+#  7. YYYY-MM-DD-HHMMSS   — Signal messenger
+#  8. YYYYMMDD (date only) — WhatsApp (IMG-YYYYMMDD-WAxxxx), day-resolution fallback
 #
 parse_date_from_filename() {
     local filename="$1"
@@ -698,7 +704,28 @@ parse_date_from_filename() {
     
     local year month day hour min sec
     
-    # Pattern 1: ...YYYYMMDD_HHMMSS... (underscore separator)
+    # Pattern 1: FB_IMG_/FB_VID_ unix timestamp (10 or 13 digits)
+    # Covers: FB_IMG_1697376732123.jpg, FB_VID_1697376732.mp4
+    if [[ "$basename" =~ FB_(IMG|VID)_([0-9]{10,13}) ]]; then
+        local ts="${BASH_REMATCH[2]}"
+        local seconds="${ts:0:10}"
+        local millis="000"
+        if [ "${#ts}" -eq 13 ]; then
+            millis="${ts:10:3}"
+        fi
+        local parsed_date
+        parsed_date=$(date -d "@$seconds" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        if [ -n "$parsed_date" ]; then
+            if [ "$millis" != "000" ]; then
+                echo "${parsed_date}.${millis}"
+            else
+                echo "$parsed_date"
+            fi
+            return 0
+        fi
+    fi
+
+    # Pattern 2: ...YYYYMMDD_HHMMSS... (underscore separator)
     # Covers: IMG_, VID_, PXL_, MVIMG_, PANO_, Screenshot_, bare YYYYMMDD_HHMMSS, etc.
     if [[ "$basename" =~ ([0-9]{8})_([0-9]{6}) ]]; then
         local date_part="${BASH_REMATCH[1]}"
@@ -708,8 +735,19 @@ parse_date_from_filename() {
         echo "${year}-${month}-${day} ${hour}:${min}:${sec}"
         return 0
     fi
+
+    # Pattern 3: ...YYYYMMDD.HHMMSS... (dot separator)
+    # Covers: IMG_20231015.143022.jpg
+    if [[ "$basename" =~ ([0-9]{8})\.([0-9]{6}) ]]; then
+        local date_part="${BASH_REMATCH[1]}"
+        local time_part="${BASH_REMATCH[2]}"
+        year="${date_part:0:4}"; month="${date_part:4:2}"; day="${date_part:6:2}"
+        hour="${time_part:0:2}"; min="${time_part:2:2}"; sec="${time_part:4:2}"
+        echo "${year}-${month}-${day} ${hour}:${min}:${sec}"
+        return 0
+    fi
     
-    # Pattern 2: ...YYYYMMDD-HHMMSS... (dash separator)
+    # Pattern 4: ...YYYYMMDD-HHMMSS... (dash separator)
     # Covers: Screenshot_YYYYMMDD-HHMMSS (Android), some cameras
     if [[ "$basename" =~ ([0-9]{8})-([0-9]{6}) ]]; then
         local date_part="${BASH_REMATCH[1]}"
@@ -720,14 +758,21 @@ parse_date_from_filename() {
         return 0
     fi
     
-    # Pattern 3: YYYY-MM-DD_HH-MM-SS (dashes in both date and time parts)
+    # Pattern 5: YYYY-MM-DD_HH-MM-SS (dashes in both date and time parts)
     # Covers: photo_2023-10-15_14-30-22.jpg
     if [[ "$basename" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})_([0-9]{2})-([0-9]{2})-([0-9]{2}) ]]; then
         echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
         return 0
     fi
     
-    # Pattern 4: YYYY-MM-DD-HHMMSS (Signal: signal-2023-10-15-143022001.jpg)
+    # Pattern 6: YYYY-MM-DD-HH-MM-SS (dashes everywhere, DYTCamera format)
+    # Covers: 2024-11-21-19-21-29, 2025-07-04-19-01-50-b09d0, etc.
+    if [[ "$basename" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{2})-([0-9]{2})-([0-9]{2}) ]]; then
+        echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+        return 0
+    fi
+    
+    # Pattern 7: YYYY-MM-DD-HHMMSS (Signal: signal-2023-10-15-143022001.jpg)
     if [[ "$basename" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{6}) ]]; then
         local time_part="${BASH_REMATCH[4]}"
         hour="${time_part:0:2}"; min="${time_part:2:2}"; sec="${time_part:4:2}"
@@ -735,7 +780,7 @@ parse_date_from_filename() {
         return 0
     fi
     
-    # Pattern 5: YYYYMMDD date-only (WhatsApp: IMG-20231015-WA0001.jpg)
+    # Pattern 8: YYYYMMDD date-only (WhatsApp: IMG-20231015-WA0001.jpg)
     # Time is set to 00:00:00 — only day-level precision
     if [[ "$basename" =~ ([0-9]{8}) ]]; then
         local date_part="${BASH_REMATCH[1]}"

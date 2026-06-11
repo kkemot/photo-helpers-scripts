@@ -2,7 +2,7 @@
 
 A comprehensive suite of bash scripts for organizing, managing, and maintaining photo and video collections based on EXIF metadata, filenames, and directory structure.
 
-Designed to improve photo and video organization by automating directory structure creation based on EXIF dates. Supports both one-time organization and recurring execution via scheduler on NAS (e.g., Synology NAS DS425+).
+Designed to improve photo and video organization by automating directory structure creation based on EXIF dates. Supports automatic filename date parsing (including FB_IMG/FB_VID unix timestamps and DYTCamera format `YYYY-MM-DD-HH-MM-SS`). Works with both one-time organization and recurring execution via scheduler on NAS (e.g., Synology NAS DS425+).
 
 ## Overview
 
