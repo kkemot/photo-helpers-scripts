@@ -17,8 +17,10 @@ LOG_DIR="${LOG_DIR:-.}"
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="."
 
-# Lock file (prevents multiple simultaneous runs)
-LOCK_FILE="/tmp/manage_images.lock"
+# Lock file (prevents multiple simultaneous runs against the same target directory)
+# Use a hash of the canonical destination directory so runs targeting different output
+# directories can execute concurrently without colliding.
+LOCK_FILE=""
 
 # ====================================
 # CONFIGURATION
@@ -90,6 +92,39 @@ EXCLUDE_DIRS=(
     "desktop.ini"
     "ehthumbs.db"
 )
+
+canonicalize_path() {
+    local path="$1"
+
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m "$path" 2>/dev/null || printf '%s' "$path"
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f "$path" 2>/dev/null || printf '%s' "$path"
+    else
+        if [ -d "$path" ]; then
+            (cd "$path" 2>/dev/null && pwd)
+        else
+            local dir
+            dir=$(dirname "$path")
+            local base
+            base=$(basename "$path")
+            if [ -d "$dir" ]; then
+                (cd "$dir" 2>/dev/null && printf '%s/%s' "$(pwd)" "$base")
+            else
+                printf '%s' "$path"
+            fi
+        fi
+    fi
+}
+
+set_lock_file() {
+    local output_dir="$1"
+    local canonical_output
+    canonical_output=$(canonicalize_path "$output_dir")
+    local lock_hash
+    lock_hash=$(printf '%s' "$canonical_output" | md5sum | cut -d' ' -f1)
+    LOCK_FILE="/tmp/manage_images_output_${lock_hash}.lock"
+}
 
 # ====================================
 # FUNCTIONS
@@ -270,15 +305,135 @@ build_extension_pattern() {
     echo "$pattern"
 }
 
-# Check if exiftool exists
+# Download the latest ExifTool release from exiftool.org and install it
+# into "$SCRIPT_DIR/Image-ExifTool". Returns 0 on success, 1 on any failure.
+#
+# Triggered automatically by check_exiftool() when the bundled binary is
+# missing. Set NO_AUTO_DOWNLOAD=1 in the environment to disable.
+download_exiftool() {
+    local target_dir="$SCRIPT_DIR/Image-ExifTool"
+    local base_url="https://exiftool.org"
+
+    if [ "${NO_AUTO_DOWNLOAD:-0}" = "1" ]; then
+        echo "Auto-download disabled (NO_AUTO_DOWNLOAD=1)."
+        return 1
+    fi
+
+    echo "ExifTool not found at: $EXIFTOOL"
+    echo "Attempting to download the latest release from $base_url ..."
+
+    # Need curl or wget, plus tar
+    local fetcher=""
+    if command -v curl >/dev/null 2>&1; then
+        fetcher="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        fetcher="wget"
+    else
+        echo "Error: neither 'curl' nor 'wget' is available — cannot download ExifTool."
+        echo "       Install it manually: https://exiftool.org/install.html"
+        return 1
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        echo "Error: 'tar' is not available — cannot extract ExifTool archive."
+        return 1
+    fi
+
+    # Resolve latest version from the well-known endpoint
+    local version=""
+    if [ "$fetcher" = "curl" ]; then
+        version=$(curl -fsSL "$base_url/ver.txt" 2>/dev/null | tr -d '[:space:]')
+    else
+        version=$(wget -qO- "$base_url/ver.txt" 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [ -z "$version" ]; then
+        echo "Error: could not determine latest ExifTool version (no response from $base_url/ver.txt)."
+        return 1
+    fi
+    echo "  Latest version: $version"
+
+    # Download into a temporary directory and only commit on full success
+    local tmpdir
+    tmpdir=$(mktemp -d 2>/dev/null) || {
+        echo "Error: cannot create temporary directory for download."
+        return 1
+    }
+    local tarball="$tmpdir/exiftool.tar.gz"
+    local url="$base_url/Image-ExifTool-${version}.tar.gz"
+
+    echo "  Downloading: $url"
+    if [ "$fetcher" = "curl" ]; then
+        if ! curl -fsSL -o "$tarball" "$url" 2>/dev/null; then
+            echo "Error: download failed."
+            rm -rf "$tmpdir"
+            return 1
+        fi
+    else
+        if ! wget -q -O "$tarball" "$url" 2>/dev/null; then
+            echo "Error: download failed."
+            rm -rf "$tmpdir"
+            return 1
+        fi
+    fi
+
+    echo "  Extracting..."
+    if ! tar -xzf "$tarball" -C "$tmpdir" 2>/dev/null; then
+        echo "Error: extraction failed (archive may be corrupt)."
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Locate the extracted Image-ExifTool-XX.XX/ directory
+    local extracted
+    extracted=$(find "$tmpdir" -maxdepth 1 -type d -name 'Image-ExifTool-*' 2>/dev/null | head -1)
+    if [ -z "$extracted" ] || [ ! -f "$extracted/exiftool" ]; then
+        echo "Error: extracted archive does not contain the expected 'exiftool' script."
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Install: replace any pre-existing Image-ExifTool/ directory atomically-ish
+    if [ -d "$target_dir" ]; then
+        rm -rf "$target_dir" || {
+            echo "Error: cannot remove existing $target_dir (check permissions)."
+            rm -rf "$tmpdir"
+            return 1
+        }
+    fi
+    if ! mv "$extracted" "$target_dir" 2>/dev/null; then
+        echo "Error: cannot install ExifTool to $target_dir (check permissions)."
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    chmod +x "$target_dir/exiftool" 2>/dev/null
+    rm -rf "$tmpdir"
+
+    # Verify the install actually runs
+    if [ ! -x "$target_dir/exiftool" ] || ! "$target_dir/exiftool" -ver >/dev/null 2>&1; then
+        echo "Error: ExifTool installed but does not execute (Perl missing or layout invalid)."
+        return 1
+    fi
+
+    echo "ExifTool $version installed to: $target_dir"
+    echo ""
+    return 0
+}
+
+# Check if exiftool exists; auto-download the latest release if it does not.
 check_exiftool() {
     if [ ! -f "$EXIFTOOL" ]; then
-        echo "Error: exiftool not found at $EXIFTOOL"
+        if ! download_exiftool; then
+            echo "Error: exiftool not found at $EXIFTOOL and auto-download failed."
+            exit 1
+        fi
+    fi
+
+    # Show exiftool version
+    local version
+    version=$("$EXIFTOOL" -ver 2>/dev/null)
+    if [ -z "$version" ]; then
+        echo "Error: $EXIFTOOL is present but cannot execute (Perl missing?)."
         exit 1
     fi
-    
-    # Show exiftool version
-    local version=$("$EXIFTOOL" -ver)
     echo "ExifTool version: $version"
     echo ""
 }
@@ -353,107 +508,52 @@ is_video_file() {
     return 1
 }
 
-# Extract photo creation date from EXIF (with milliseconds if available)
-# 
-# FALLBACK HIERARCHY (from most to least reliable):
-# 1. DateTimeOriginal (EXIF:DateTimeOriginal) + SubSecTimeOriginal
-#    - Original time photo was taken by camera
-#    - Most reliable source
-# 
-# 2. CreateDate (EXIF:CreateDate) + SubSecTimeDigitized or SubSecTime
-#    - Digitization time or file creation time
-#    - Second most reliable source
+# Extract all relevant EXIF date/subsec tags in a SINGLE exiftool invocation.
 #
-# 3. MediaCreateDate (QuickTime:MediaCreateDate)
-#    - For video files (MP4, MOV, etc.)
+# Rationale: exiftool is a Perl script with significant startup cost (~0.3 s).
+# Issuing 8 separate calls per file (one per tag) was the dominant bottleneck;
+# batching them into one call cuts EXIF analysis time by roughly 8x.
 #
-# 4. TrackCreateDate (QuickTime:TrackCreateDate)
-#    - Alternative field for video
+# The function sets the following global variables (read by analyze_exif_dates):
+#   EXIF_DATETIME_ORIGINAL, EXIF_SUBSEC_ORIG,
+#   EXIF_CREATE_DATE,       EXIF_SUBSEC_DIG,    EXIF_SUBSEC_TIME,
+#   EXIF_MEDIA_CREATE,      EXIF_TRACK_CREATE,  EXIF_MODIFY_DATE
 #
-# 5. ModifyDate (EXIF:ModifyDate) + SubSecTime
-#    - Date of last metadata modification
-#    - Less reliable (changes when edited)
+# Output format from exiftool -T is tab-separated, with '-' as the missing-value
+# marker. The order of fields in the output matches the order of -TAG arguments
+# on the command line, so positional parsing via `read` is safe.
 #
-# 6. Filename parsing (if filename contains date pattern)
-#    - Patterns: YYYYMMDD_HHMMSS, YYYYMMDD-HHMMSS,
-#                YYYY-MM-DD_HH-MM-SS, YYYY-MM-DD-HHMMSS,
-#                YYYYMMDD (date-only, WhatsApp etc.)
-#    - Extracted date is validated (min_year check)
-#    - Automatically written to EXIF (DateTimeOriginal + CreateDate)
-#    - See log_exif_updates.log for write operations
-#
-# 7. XMP sidecar file (filename.xmp alongside the photo)
-#    - Adobe/Lightroom/Darktable metadata
-#    - Fields: xmp:CreateDate, xmp:MetadataDate, photoshop:DateCreated
-#
-# 8. Directory path parsing (YYYY/MM/DD in path)
-#    - Day-level precision only (time set to 00:00:00)
-#    - Used when file is already partially organized
-#
-# 9. FileModifyDate (system file modification date)
-#    - Last resort, least reliable (changes on copy/move)
-#    - Validated with warning if very recent (< 30 days)
-#
-# MILLISECONDS: Photos may contain milliseconds in fields:
-# - SubSecTimeOriginal, SubSecTimeDigitized, SubSecTime
-# - Format: 0-999 (e.g. "123" means 0.123 seconds)
-#
-get_exif_date() {
+# The fallback hierarchy that consumes these values (DateTimeOriginal →
+# CreateDate → MediaCreateDate → TrackCreateDate → ModifyDate → filename →
+# XMP → directory path → FileModifyDate) is implemented in process_exif_data.
+extract_exif_dates() {
     local file="$1"
-    local date=""
-    local subsec=""
-    local source=""
-    
-    # 1. Try DateTimeOriginal (most important date - when photo was taken)
-    date=$("$EXIFTOOL" -DateTimeOriginal -d "%Y-%m-%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-    if [ -n "$date" ]; then
-        subsec=$("$EXIFTOOL" -SubSecTimeOriginal -s3 "$file" 2>/dev/null)
-        source="DateTimeOriginal"
-    fi
-    
-    # 2. If no DateTimeOriginal, try CreateDate
-    if [ -z "$date" ]; then
-        date=$("$EXIFTOOL" -CreateDate -d "%Y-%m-%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        if [ -n "$date" ]; then
-            subsec=$("$EXIFTOOL" -SubSecTimeDigitized -s3 "$file" 2>/dev/null)
-            [ -z "$subsec" ] && subsec=$("$EXIFTOOL" -SubSecTime -s3 "$file" 2>/dev/null)
-            source="CreateDate"
-        fi
-    fi
-    
-    # 3. For video: MediaCreateDate
-    if [ -z "$date" ] && is_video_file "$file"; then
-        date=$("$EXIFTOOL" -MediaCreateDate -d "%Y-%m-%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        [ -n "$date" ] && source="MediaCreateDate"
-    fi
-    
-    # 4. For video: TrackCreateDate
-    if [ -z "$date" ] && is_video_file "$file"; then
-        date=$("$EXIFTOOL" -TrackCreateDate -d "%Y-%m-%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        [ -n "$date" ] && source="TrackCreateDate"
-    fi
-    
-    # 5. Last resort: ModifyDate (least reliable)
-    if [ -z "$date" ]; then
-        date=$("$EXIFTOOL" -ModifyDate -d "%Y-%m-%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        if [ -n "$date" ]; then
-            subsec=$("$EXIFTOOL" -SubSecTime -s3 "$file" 2>/dev/null)
-            source="ModifyDate"
-        fi
-    fi
-    
-    # 6. Last resort: system file date
-    if [ -z "$date" ]; then
-        date=$(stat -c "%y" "$file" 2>/dev/null | cut -d'.' -f1)
-        [ -n "$date" ] && source="FileModifyDate"
-    fi
-    
-    # Add milliseconds if available and return date with source
-    if [ -n "$date" ] && [ -n "$subsec" ]; then
-        echo "${date}.${subsec}|${source}"
-    elif [ -n "$date" ]; then
-        echo "${date}|${source}"
-    fi
+    local exif_line
+
+    # -T  : tab-separated single-line output, '-' for missing tags
+    # -d  : format applied to date tags only (SubSec tags are unaffected)
+    exif_line=$("$EXIFTOOL" -T -d "%Y:%m:%d %H:%M:%S" \
+        -DateTimeOriginal -SubSecTimeOriginal \
+        -CreateDate -SubSecTimeDigitized -SubSecTime \
+        -MediaCreateDate -TrackCreateDate -ModifyDate \
+        "$file" 2>/dev/null)
+
+    IFS=$'\t' read -r \
+        EXIF_DATETIME_ORIGINAL EXIF_SUBSEC_ORIG \
+        EXIF_CREATE_DATE EXIF_SUBSEC_DIG EXIF_SUBSEC_TIME \
+        EXIF_MEDIA_CREATE EXIF_TRACK_CREATE EXIF_MODIFY_DATE \
+        <<< "$exif_line"
+
+    # Normalize exiftool's missing-value marker '-' to empty string so that
+    # downstream `[ -n "$x" ]` checks behave correctly.
+    [ "$EXIF_DATETIME_ORIGINAL" = "-" ] && EXIF_DATETIME_ORIGINAL=""
+    [ "$EXIF_SUBSEC_ORIG"       = "-" ] && EXIF_SUBSEC_ORIG=""
+    [ "$EXIF_CREATE_DATE"       = "-" ] && EXIF_CREATE_DATE=""
+    [ "$EXIF_SUBSEC_DIG"        = "-" ] && EXIF_SUBSEC_DIG=""
+    [ "$EXIF_SUBSEC_TIME"       = "-" ] && EXIF_SUBSEC_TIME=""
+    [ "$EXIF_MEDIA_CREATE"      = "-" ] && EXIF_MEDIA_CREATE=""
+    [ "$EXIF_TRACK_CREATE"      = "-" ] && EXIF_TRACK_CREATE=""
+    [ "$EXIF_MODIFY_DATE"       = "-" ] && EXIF_MODIFY_DATE=""
 }
 
 # Generate proposed new path for file
@@ -649,22 +749,16 @@ analyze_exif_dates() {
             last_percent="$percent"
         fi
         
-        # Extract EXIF data for single file
-        local datetime_original=$("$EXIFTOOL" -DateTimeOriginal -d "%Y:%m:%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        local subsec_orig=$("$EXIFTOOL" -SubSecTimeOriginal -s3 "$file" 2>/dev/null)
-        local create_date=$("$EXIFTOOL" -CreateDate -d "%Y:%m:%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        local subsec_dig=$("$EXIFTOOL" -SubSecTimeDigitized -s3 "$file" 2>/dev/null)
-        local subsec_time=$("$EXIFTOOL" -SubSecTime -s3 "$file" 2>/dev/null)
-        local media_create=$("$EXIFTOOL" -MediaCreateDate -d "%Y:%m:%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        local track_create=$("$EXIFTOOL" -TrackCreateDate -d "%Y:%m:%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        local modify_date=$("$EXIFTOOL" -ModifyDate -d "%Y:%m:%d %H:%M:%S" -s3 "$file" 2>/dev/null)
-        
+        # Extract all EXIF date/subsec tags in a single exiftool call.
+        # Populates EXIF_* globals (see extract_exif_dates for details).
+        extract_exif_dates "$file"
+
         # Process this file with extracted EXIF data
-        process_exif_data "$file" "$datetime_original" "$subsec_orig" \
-            "$create_date" "$subsec_dig" "$subsec_time" \
-            "$media_create" "$track_create" "$modify_date" \
+        process_exif_data "$file" "$EXIF_DATETIME_ORIGINAL" "$EXIF_SUBSEC_ORIG" \
+            "$EXIF_CREATE_DATE" "$EXIF_SUBSEC_DIG" "$EXIF_SUBSEC_TIME" \
+            "$EXIF_MEDIA_CREATE" "$EXIF_TRACK_CREATE" "$EXIF_MODIFY_DATE" \
             "$output_dir" "$output_file" "$use_fallback" "$min_year" "$rejected_log" "$log_subdir"
-            
+
     done < "$file_list"
     
     # Show information about ignored files
@@ -681,8 +775,7 @@ analyze_exif_dates() {
             echo "Warning: $rejected_count files without any date (details in $rejected_log)"
         fi
     fi
-    
-    rm -f "$temp_exif_output"
+
     echo ""
 }
 
@@ -781,9 +874,17 @@ parse_date_from_filename() {
     fi
     
     # Pattern 8: YYYYMMDD date-only (WhatsApp: IMG-20231015-WA0001.jpg)
-    # Time is set to 00:00:00 — only day-level precision
-    if [[ "$basename" =~ ([0-9]{8}) ]]; then
-        local date_part="${BASH_REMATCH[1]}"
+    # Time is set to 00:00:00 — only day-level precision.
+    #
+    # IMPORTANT: the 8-digit sequence MUST be bounded by non-digits (start of
+    # string / end of string / any non-digit character). Without this anchor,
+    # a filename like "IMG_20231015143022.jpg" (14 contiguous digits, no
+    # separators) would incorrectly match its first 8 digits and lose the time
+    # part. Anchoring forces such concatenated strings to fall through, which
+    # is correct: we have no reliable way to know where the date ends and the
+    # time begins in an unseparated digit run.
+    if [[ "$basename" =~ (^|[^0-9])([0-9]{8})($|[^0-9]) ]]; then
+        local date_part="${BASH_REMATCH[2]}"
         year="${date_part:0:4}"; month="${date_part:4:2}"; day="${date_part:6:2}"
         # Basic sanity: month 01-12, day 01-31
         if [[ "$month" =~ ^(0[1-9]|1[0-2])$ ]] && [[ "$day" =~ ^(0[1-9]|[12][0-9]|3[01])$ ]]; then
@@ -806,7 +907,8 @@ write_exif_date() {
     local exif_date=$(echo "$date" | sed 's/^\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1:\2:\3/')
     
     # Write DateTimeOriginal and CreateDate tags
-    if ./Image-ExifTool/exiftool -DateTimeOriginal="$exif_date" -CreateDate="$exif_date" -overwrite_original "$file" >/dev/null 2>&1; then
+    # Use the auto-detected $EXIFTOOL path so the script works from any cwd.
+    if "$EXIFTOOL" -DateTimeOriginal="$exif_date" -CreateDate="$exif_date" -overwrite_original "$file" >/dev/null 2>&1; then
         echo "[SUCCESS] $file : Added DateTimeOriginal=$exif_date (parsed from $source)" >> "$exif_log"
         return 0
     else
@@ -1271,35 +1373,6 @@ display_statistics() {
 
 main() {
     # ====================================
-    # LOCK FILE - Prevent multiple runs
-    # ====================================
-    if [ -f "$LOCK_FILE" ]; then
-        local lock_pid=$(head -n 1 "$LOCK_FILE" 2>/dev/null)
-        local lock_time=$(tail -n 1 "$LOCK_FILE" 2>/dev/null)
-        echo "Error: Script is already running"
-        echo "  Lock file: $LOCK_FILE"
-        echo "  Process ID: $lock_pid"
-        echo "  Started at: $lock_time"
-        echo ""
-        echo "If you are sure no other instance is running, remove the lock file:"
-        echo "  rm $LOCK_FILE"
-        exit 1
-    fi
-    
-    # Create lock file with PID and timestamp
-    {
-        echo "$$"
-        date "+%Y-%m-%d %H:%M:%S"
-    } > "$LOCK_FILE" || {
-        echo "Error: Cannot create lock file at $LOCK_FILE"
-        exit 1
-    }
-    
-    # Cleanup lock file on exit, error, or signal (INT=Ctrl+C, TERM=termination)
-    trap "rm -f '$LOCK_FILE'" EXIT
-    trap "rm -f '$LOCK_FILE'; exit 130" INT TERM
-    
-    # ====================================
     # LOG DIRECTORY WITH TIMESTAMP
     # ====================================
     local TIMESTAMP_START=$(date "+%Y_%m_%d_%H_%M_%S")
@@ -1413,6 +1486,46 @@ main() {
         unset _raw_patterns _p
     fi
     
+    # Determine lock path based on the destination directory to avoid
+    # unrelated runs blocking each other when they use different output targets.
+    set_lock_file "$output_dir"
+
+    # Acquire lock file and prevent concurrent writes to the same output
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid=$(head -n 1 "$LOCK_FILE" 2>/dev/null)
+        local lock_time
+        lock_time=$(tail -n 1 "$LOCK_FILE" 2>/dev/null)
+
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" >/dev/null 2>&1; then
+            echo "Error: Another instance is already running for the same output directory"
+            echo "  Lock file: $LOCK_FILE"
+            echo "  Process ID: $lock_pid"
+            echo "  Started at: $lock_time"
+            echo ""
+            echo "If you are sure no other instance is running, remove the lock file:"
+            echo "  rm $LOCK_FILE"
+            exit 1
+        fi
+
+        echo "Warning: Removing stale lock file: $LOCK_FILE" >&2
+        rm -f "$LOCK_FILE" 2>/dev/null || {
+            echo "Error: Cannot remove stale lock file: $LOCK_FILE"
+            exit 1
+        }
+    fi
+
+    {
+        echo "$$"
+        date "+%Y-%m-%d %H:%M:%S"
+    } > "$LOCK_FILE" || {
+        echo "Error: Cannot create lock file at $LOCK_FILE"
+        exit 1
+    }
+
+    trap "rm -f '$LOCK_FILE'" EXIT
+    trap "rm -f '$LOCK_FILE'; exit 130" INT TERM
+
     # Check requirements
     check_exiftool
     check_source_dir "$src_dir"

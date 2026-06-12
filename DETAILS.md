@@ -36,7 +36,10 @@ Organizes photo and video files into a YYYY/MM/DD directory structure based on E
 chmod +x manage_images.sh
 ```
 
-ExifTool is included in the Image-ExifTool/ directory.
+ExifTool is auto-downloaded into the `Image-ExifTool/` directory on first run
+if missing (set `NO_AUTO_DOWNLOAD=1` to disable). A pre-existing system
+`exiftool` on `$PATH` is also accepted by `test_manage_images.sh` if the
+bundled binary is absent.
 
 ### Syntax
 
@@ -102,16 +105,21 @@ The script attempts to extract dates from multiple sources in this order:
 3. MediaCreateDate (for video files)
 4. TrackCreateDate (alternative video date field)
 5. ModifyDate (last modification time in EXIF)
-6. Filename Parsing — patterns supported (in order):
-   - `YYYYMMDD_HHMMSS` — Android/Samsung (`IMG_`, `VID_`, `PXL_`, `MVIMG_`, `PANO_`, etc.)
-   - `YYYYMMDD-HHMMSS` — Android screenshots (`Screenshot_YYYYMMDD-HHMMSS`)
-   - `FB_IMG_/FB_VID_` unix timestamp — Facebook shared media (`FB_IMG_1697376732123.jpg`)
-   - `YYYYMMDD.HHMMSS` — dot-separated time (`IMG_20231015.143022.jpg`)
-   - `YYYY-MM-DD_HH-MM-SS` — some export tools
-   - `YYYY-MM-DD-HH-MM-SS` — **DYTCamera and other apps** (NEW: `2024-11-21-19-21-29`, `2025-07-04-19-01-50-b09d0`)
-   - `YYYY-MM-DD-HHMMSS` — Signal messenger (`signal-2023-10-15-143022.jpg`)
-   - `YYYYMMDD` (date only, time = 00:00:00) — WhatsApp (`IMG-20231015-WA0001.jpg`)
-   - Dates are validated (min_year check) and automatically written back to EXIF
+6. Filename Parsing — patterns are tried in this exact order (first match wins):
+   1. `FB_IMG_/FB_VID_<unix_ts>` — Facebook shared media (`FB_IMG_1697376732123.jpg`)
+   2. `YYYYMMDD_HHMMSS` — Android / Samsung / Pixel (`IMG_`, `VID_`, `PXL_`, `MVIMG_`, `PANO_`, ...)
+   3. `YYYYMMDD.HHMMSS` — dot-separated time (`IMG_20231015.143022.jpg`)
+   4. `YYYYMMDD-HHMMSS` — Android screenshots (`Screenshot_YYYYMMDD-HHMMSS`)
+   5. `YYYY-MM-DD_HH-MM-SS` — some export tools (`photo_2023-10-15_14-30-22.jpg`)
+   6. `YYYY-MM-DD-HH-MM-SS` — DYTCamera and similar (`2024-11-21-19-21-29-b09d0.jpg`)
+   7. `YYYY-MM-DD-HHMMSS` — Signal messenger (`signal-2023-10-15-143022.jpg`)
+   8. `YYYYMMDD` (date only, time = 00:00:00) — WhatsApp (`IMG-20231015-WA0001.jpg`).
+      The 8-digit run must be bounded by non-digits (regex anchor added in v3.1)
+      so that contiguous strings like `IMG_20231015143022.jpg` (14 digits) are
+      NOT mis-parsed as a date.
+   - All extracted dates are validated (min_year check) and automatically
+     written back to `DateTimeOriginal` + `CreateDate` in EXIF for future runs
+     (logged to `log_exif_updates.log`).
 7. XMP sidecar file (`filename.xmp` alongside the photo — Adobe, Lightroom, Darktable)
 8. Directory path (`YYYY/MM/DD` in path — day-level precision, time = 00:00:00)
 9. FileModifyDate (least reliable - system file modification date)
@@ -714,6 +722,32 @@ File extensions are matched case-insensitively:
 ---
 
 ## Version History
+
+### Version 3.1 (June 2026)
+- **Auto-download of ExifTool**: when `Image-ExifTool/exiftool` is missing,
+  `check_exiftool` now triggers `download_exiftool` which fetches the latest
+  release from `https://exiftool.org`, extracts it, verifies it executes,
+  and installs it next to the script. Opt-out via `NO_AUTO_DOWNLOAD=1`.
+  Requires `curl` or `wget` and `tar`.
+- **Performance: single exiftool call per file** (replaces 8 separate
+  invocations). `extract_exif_dates` requests all relevant tags
+  (`DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate`,
+  `ModifyDate`, and three `SubSec*`) in one `-T`-separated batch. Roughly
+  8× speedup on EXIF analysis — confirmed by integration test (~2 files/s
+  on commodity hardware vs ~0.25 files/s before).
+- **Fixed**: hardcoded `./Image-ExifTool/exiftool` in `write_exif_date`
+  replaced with `$EXIFTOOL`. Previously, EXIF write-back of filename-parsed
+  dates silently failed when the script was run from a directory other than
+  its own location.
+- **Fixed**: pattern 8 (date-only `YYYYMMDD` parser) is now anchored by
+  non-digit boundaries: `(^|[^0-9])([0-9]{8})($|[^0-9])`. Previously a
+  filename like `IMG_20231015143022.jpg` (14 contiguous digits) would
+  greedily match the first 8 as a date and lose the time portion.
+- **Removed dead code**: `get_exif_date()` (~100 lines, never called) and a
+  stray `rm -f "$temp_exif_output"` referencing an uninitialised variable.
+- **Added**: `test_manage_images.sh` — integration smoke test with 500
+  synthetic files across 23 categories, 12 assertions, ~5 min runtime.
+  See README → Testing.
 
 ### Version 3.0 (May 2026)
 - Added `--ignoreFile` option to skip files by path pattern (before EXIF analysis)

@@ -21,20 +21,24 @@ For detailed information on how each script works, functionality, and troublesho
 # 1. Make scripts executable (only needed once)
 chmod +x manage_images.sh remove_empty_dirs.sh
 
-# 2. Verify ExifTool is present (required dependency, included in repository)
-ls Image-ExifTool/exiftool
-
-# 3. Test run — no files are changed (dry-run is the default)
+# 2. Test run — no files are changed (dry-run is the default).
+#    ExifTool is auto-downloaded from exiftool.org on first run if missing.
 ./manage_images.sh /path/to/source /path/to/target
 ```
 
-> **Directory layout required:**
+> **Directory layout** (Image-ExifTool/ is created automatically on first run
+> if absent; place it manually only if your machine has no internet access):
 > ```
 > manage_images.sh
 > remove_empty_dirs.sh
-> Image-ExifTool/
->   exiftool          ← must be here
+> test_manage_images.sh    (optional — see Testing section)
+> Image-ExifTool/          (auto-created if missing)
+>   exiftool
+>   lib/
 > ```
+>
+> To disable auto-download (e.g. on air-gapped systems where you bundled
+> ExifTool yourself), export `NO_AUTO_DOWNLOAD=1` before running.
 
 ### Organize Photos and Videos
 
@@ -109,6 +113,7 @@ LOG_DIR=/tmp/logs /path/to/scripts/manage_images.sh \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOG_DIR` | `.` (current dir) | Directory where log subdirectories are created |
+| `NO_AUTO_DOWNLOAD` | `0` | Set to `1` to disable automatic download of ExifTool when `Image-ExifTool/exiftool` is missing. Useful on air-gapped systems or when ExifTool is provided by another means. |
 
 **`--keepSourceTag` — built-in source types:**
 
@@ -160,19 +165,24 @@ Videos: mp4, mov, avi, mkv, wmv, flv, webm, m4v, mpg, mpeg, 3gp, mts, m2ts
 
 ## Features
 
+- Auto-downloads latest ExifTool from exiftool.org on first run if absent (opt-out via `NO_AUTO_DOWNLOAD=1`)
 - Prevents simultaneous execution with automatic lock file mechanism
 - Organizes logs into dated subdirectories (logs/YYYY_MM_DD_HH_MM_SS/)
 - Generates execution status report (status.log) with timing information
-- Duplicate detection based on MD5 checksums
+- Duplicate detection based on MD5 checksums (never overwrites — collisions get `_1`, `_2`, ... suffixes; identical MD5s are skipped)
 - Automatic EXIF date fallback hierarchy with validation
 - Detailed logging of all operations (copies, moves, skipped files, errors)
 - File path pattern filtering (`--ignoreFile`) to skip screenshots, screen captures, etc.
+- Integration smoke test (`test_manage_images.sh`) covering all 8 date patterns + edge cases
 
 ## Requirements
 
-- Bash shell (Linux/Unix/macOS)
-- ExifTool (included in Image-ExifTool/ directory)
-- Standard Unix tools: find, md5sum, stat, awk, sed
+- Bash 4+ shell (Linux/Unix/macOS)
+- Perl (required by ExifTool itself; pre-installed on most Linux/macOS, available as a package on Synology DSM)
+- ExifTool — auto-downloaded into `Image-ExifTool/` on first run, or use a system install
+- Standard Unix tools: `find`, `md5sum`, `stat`, `awk`, `sed`
+- For auto-download: `curl` or `wget`, plus `tar`
+- For the integration test (`test_manage_images.sh`): additionally `base64`, `date -d`, `touch -t`
 
 ## Disclaimer
 
@@ -190,10 +200,33 @@ bash /volume1/scripts/manage_images.sh --task=move --limit=20000 /volume1/IMPORT
 
 Then schedule this script to run periodically (e.g., daily, weekly) via Synology's Task Scheduler.
 
+## Testing
+
+`test_manage_images.sh` is an integration smoke test that generates ~500
+synthetic photo/video files across 23 categories (every supported date source,
+all 8 filename patterns, XMP sidecar, duplicates, ignored thumbs, the
+pattern-8 trap, UTF-8 paths), runs `manage_images.sh --task=move` against
+them, asserts 12 invariants on the output, and reports PASS/FAIL with total
+elapsed time.
+
+```bash
+# Run the test; cleans test/ on success, preserves it on failure for inspection.
+./test_manage_images.sh
+
+# Always keep generated artifacts (useful when debugging assertions)
+./test_manage_images.sh --keep
+```
+
+Exit codes: `0` = all assertions pass, `1` = one or more failed, `2` = setup
+error. Typical run takes ~5 minutes on a laptop (500 files × 1 consolidated
+exiftool call each + cp + MD5 verification). Suitable as a pre-deploy smoke
+test before running on large collections (e.g. on a NAS).
+
 ## Documentation
 
 - [DETAILS.md](DETAILS.md) - Detailed specifications, workflows, and technical information
 - [README.md](README.md) - This file (quick reference)
+- `test_manage_images.sh --help` - Integration test usage
 
 ## License
 
